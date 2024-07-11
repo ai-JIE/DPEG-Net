@@ -628,12 +628,12 @@ class DPEG(nn.Module):
         if x.size()[1] == 1:
             x = x.repeat(1, 3, 1, 1)
 
-        # backbone  是  MIT
+        # backbone
         output_enc = self.backbone(x)
 
         b, c, _, _ = output_enc[2].shape
 
-        # 改后---------------Decoder-------------------------
+        #---------------Decoder-------------------------
         tmp_1 = self.decoder_1(output_enc[2], output_enc[1])
         tmp_0 = self.decoder_0(tmp_1, output_enc[0])
 
@@ -650,10 +650,3 @@ if __name__ == '__main__':
     print('{:<30}  {:<8}'.format('Computational complexity: ', macs))
     print('{:<30}  {:<8}'.format('Number of parameters: ', params))
 
-"""
-
-最原始的三个创新点
-Computational complexity:       32.58 GMac
-Number of parameters:           42.64 M 
-
-"""
