@@ -4,7 +4,7 @@ from einops.layers.torch import Rearrange
 # from fvcore.nn import FlopCountAnalysis
 from ptflops import get_model_complexity_info
 
-from segformer.segformer import *
+from segformer import *
 
 from torch import nn
 import torch
@@ -36,13 +36,13 @@ class LayerNorm(nn.Module):
             return x
 
 
-class group_aggregation_bridge(nn.Module):
+class GCA(nn.Module):
     def __init__(self, dim_xh, dim_xl, k_size=3, d_list=[1, 2, 5, 7]):
         super().__init__()
         self.pre_project = nn.Conv2d(dim_xh, dim_xl, kernel_size=(1, 1))
         group_size = dim_xl // 2
 
-        # 空间注意力
+        # 
         self.g0 = nn.Sequential(
             LayerNorm(normalized_shape=group_size, data_format='channels_first'),
             nn.Conv2d(group_size, group_size, kernel_size=3, stride=1,
@@ -74,7 +74,7 @@ class group_aggregation_bridge(nn.Module):
         self.conv = nn.Conv2d(dim_xl * 2, dim_xl, kernel_size=(1, 1))
         self.act = nn.GELU()
 
-        # 通道注意力
+        # 
         self.channel_attn = nn.Sequential(
             nn.Conv2d(dim_xl, dim_xl // 2, kernel_size=(1, 1)),
             nn.ReLU(inplace=True),
@@ -82,14 +82,14 @@ class group_aggregation_bridge(nn.Module):
             nn.Sigmoid()
         )
 
-        # 门控注意力加在空间注意力上的
+        # 
         self.psi = nn.Sequential(
             nn.Conv2d(dim_xl, dim_xl, kernel_size=(1, 1), stride=(1, 1), padding=0, bias=True),
             nn.BatchNorm2d(dim_xl),
             nn.Sigmoid()
         )
 
-        # 残差连接
+        # 
         self.residual = nn.Sequential(
 
             nn.BatchNorm2d(dim_xl),
@@ -106,7 +106,7 @@ class group_aggregation_bridge(nn.Module):
 
     def forward(self, xH, xL):
         xH = self.pre_project(xH)
-        # xh作为下层特征，所以需要下行代码上采样(空间注意力)
+        # 
         xH = F.interpolate(xH, size=[xL.size(2), xL.size(3)], mode='bilinear', align_corners=True)
         xh = torch.chunk(xH, 4, dim=1)
         xl = torch.chunk(xL, 4, dim=1)
@@ -125,7 +125,7 @@ class group_aggregation_bridge(nn.Module):
         residual = torch.cat([xH, xL], dim=1)
         residual = self.act(self.conv(residual))
 
-        # 通道注意力
+        # 
         channel_x = self.channel_attn(residual)
 
         x = residual + x
@@ -140,7 +140,7 @@ class group_aggregation_bridge(nn.Module):
         x = self.residual(attn)
         x = x + attn
 
-        # 调制形状适配Dual-tansformer
+        # 
         b, c, _, _ = x.shape
         x = x.permute(0, 2, 3, 1).view(b, -1, c)
 
@@ -179,75 +179,8 @@ class SqueezeExcite(nn.Module):
         return x * self.gate(x_se)
 
 
-#
-# class EfficientAttention(nn.Module):
-#     """
-#     input  -> x:[B, D, H, W]
-#     output ->   [B, D, H, W]
-#
-#     in_channels:    int -> Embedding Dimension
-#     key_channels:   int -> Key Embedding Dimension,   Best: (in_channels)
-#     value_channels: int -> Value Embedding Dimension, Best: (in_channels or in_channels//2)
-#     head_count:     int -> It divides the embedding dimension by the head_count and process each part individually
-#
-#     Conv2D # of Params:  ((k_h * k_w * C_in) + 1) * C_out)
-#     """
-#
-#     def __init__(self, in_channels, key_channels, value_channels, head_count=1):
-#         super().__init__()
-#         self.in_channels = in_channels
-#         self.key_channels = key_channels
-#         self.head_count = head_count
-#
-#         self.value_channels = value_channels
-#
-#         self.keys = nn.Conv2d(in_channels, key_channels, 1)
-#         self.queries = nn.Conv2d(in_channels, key_channels, 1)
-#         # self.qk = nn.Linear(in_channels, in_channels * 2)
-#         self.values = nn.Conv2d(in_channels, value_channels, 1)
-#         self.reprojection = nn.Conv2d(value_channels, in_channels, 1)
-#         self.temperature = nn.Parameter(torch.ones(value_channels, 1, 1))
-#
-#
-#     def forward(self, input_, qk):
-#         n, _, h, w = input_.size()
-#
-#         # 改动的地方
-#         # keys = self.keys(input_).reshape((n, self.key_channels, h, w))
-#         # queries = self.queries(input_).reshape(n, self.key_channels, h, w)
-#         # values = self.values(input_).reshape((n, self.value_channels, h, w))
-#
-#         keys = self.keys(qk).reshape((n, self.key_channels, h * w))
-#         queries = self.queries(qk).reshape(n, self.key_channels, h * w)
-#         values = self.values(input_).reshape((n, self.value_channels, h * w))
-#
-#         head_key_channels = self.key_channels // self.head_count
-#         head_value_channels = self.value_channels // self.head_count
-#
-#         attended_values = []
-#         for i in range(self.head_count):
-#             key = F.softmax(keys[:, i * head_key_channels: (i + 1) * head_key_channels, :], dim=2)
-#
-#             query = F.softmax(queries[:, i * head_key_channels: (i + 1) * head_key_channels, :], dim=1)
-#
-#             value = values[:, i * head_value_channels: (i + 1) * head_value_channels, :]
-#
-#             # 改动的地方
-#             context = key * value
-#
-#             attended_value = (context * query* self.temperature).reshape(n, head_value_channels, h, w)  # n*dv
-#             attended_values.append(attended_value)
-#             # context = key @ value.transpose(1, 2)  # dk*dv
-#             # attended_value = (context.transpose(1, 2) @ query).reshape(n, head_value_channels, h, w)  # n*dv
-#             # attended_values.append(attended_value)
-#
-#         aggregated_values = torch.cat(attended_values, dim=1)
-#         attention = self.reprojection(aggregated_values)
-#
-#         return attention
 
-
-class EfficientAttention(nn.Module):
+class pixel_level_path(nn.Module):
     """
     input  -> x:[B, D, H, W]
     output ->   [B, D, H, W]
@@ -280,7 +213,7 @@ class EfficientAttention(nn.Module):
     def forward(self, input_):
         n, _, h, w = input_.size()
 
-        # 改动的地方
+        # EW_attention
         keys = self.keys(input_).reshape((n, self.key_channels, h, w))
         queries = self.queries(input_).reshape(n, self.key_channels, h, w)
         values = self.values(input_).reshape((n, self.value_channels, h, w))
@@ -311,7 +244,7 @@ class EfficientAttention(nn.Module):
         return attention
 
 
-class ChannelAttention(nn.Module):
+class global_semantic_path(nn.Module):
     """
     Input -> x: [B, N, C]
     Output -> [B, N, C]
@@ -329,8 +262,7 @@ class ChannelAttention(nn.Module):
     def forward(self, x):
         """x: [B, N, C]"""
         B, N, C = x.shape
-        # 修改的地方
-
+        # 
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads)
 
         qkv = qkv.permute(2, 0, 3, 1, 4)
@@ -338,28 +270,23 @@ class ChannelAttention(nn.Module):
         # qkv = qkv.permute(2, 0, 3, 1, 4)
         # q, k = qkv[0], qkv[1]
 
+        # EW_attention
         q = q.transpose(-2, -1)
         k = k.transpose(-2, -1)
         v = v.transpose(-2, -1)
-        # v = x.transpose(-2, -1).reshape(B,self.num_heads,C // self.num_heads,N)
-
         q = F.normalize(q, dim=-1)
         k = F.normalize(k, dim=-1)
 
-        # attn = (q @ k.transpose(-2, -1)) * self.temperature
 
-        # 改动的地方
+        # 
         attn = (q * k) * self.temperature
 
         # -------------------
         attn = attn.softmax(dim=-1)
         attn = self.attn_drop(attn)
 
-        # 改动的地方
-
         x = (attn * v).permute(0, 3, 1, 2).reshape(B, N, C)
 
-        # x = (attn @ v).permute(0, 3, 1, 2).reshape(B, N, C)
         # ------------------
         x = self.proj(x)
         x = self.proj_drop(x)
@@ -367,7 +294,7 @@ class ChannelAttention(nn.Module):
         return x
 
 
-class DualTransformerBlock(nn.Module):
+class DPVT(nn.Module):
     """
     Input  -> x (Size: (b, (H*W), d)), H, W
     Output -> (b, (H*W), d)
@@ -377,10 +304,10 @@ class DualTransformerBlock(nn.Module):
     def __init__(self, in_dim, key_dim, value_dim, head_count=1, token_mlp="mix"):
         super().__init__()
         self.norm1 = nn.LayerNorm(in_dim)
-        self.attn = EfficientAttention(in_channels=in_dim, key_channels=key_dim, value_channels=value_dim, head_count=1)
+        self.attn = pixel_level_path(in_channels=in_dim, key_channels=key_dim, value_channels=value_dim, head_count=1)
         self.norm2 = nn.LayerNorm(in_dim)
         self.norm3 = nn.LayerNorm(in_dim)
-        self.channel_attn = ChannelAttention(in_dim)
+        self.channel_attn = global_semantic_path(in_dim)
         self.norm4 = nn.LayerNorm(in_dim)
         self.norm5 = nn.LayerNorm(in_dim)
         self.norm6 = nn.LayerNorm(in_dim)
@@ -394,9 +321,9 @@ class DualTransformerBlock(nn.Module):
         self.conv3 = nn.Conv2d(in_dim, in_dim, kernel_size=(3, 3), stride=1, padding=1)
         # self.conv3 = nn.Conv2d(in_dim, in_dim, kernel_size=(3, 3), stride=1, padding=1, groups=in_dim)
 
-        # se模块
+        # 
         self.SE = SqueezeExcite(in_dim)
-        # 合并模块
+        # 
         self.residual = nn.Sequential(
 
             nn.BatchNorm2d(in_dim),
@@ -421,13 +348,13 @@ class DualTransformerBlock(nn.Module):
 
     def forward(self, x: torch.Tensor, H, W) -> torch.Tensor:
 
-        # 双路径
+        # 
         # norm1 = self.norm1(x)
         # norm1 = Rearrange("b (h w) d -> b d h w", h=H, w=W)(norm1)
         # norm1 = self.conv3(norm1)
         # norm1 = self.act3(norm1)
 
-        # 全局语义路径
+        # global_semantic_path
         seg = self.norm5(x)
         channel_attn = self.channel_attn(seg)
         add3 = seg + channel_attn
@@ -442,12 +369,12 @@ class DualTransformerBlock(nn.Module):
         mlp2 = se + self.mlp2(se, H, W)
 
 
-        # 像素级路径
+        # pixel_level_path
         norm1 = self.norm1(x)
         norm1 = Rearrange("b (h w) d -> b d h w", h=H, w=W)(norm1)
         norm1 = self.conv3(norm1)
         norm1 = self.act3(norm1)
-        # # 由语义路径过来的qk
+        # # global_semantic_path  qk
         attn = self.attn(norm1)
         attn = Rearrange("b d h w -> b (h w) d")(attn)
 
@@ -455,13 +382,13 @@ class DualTransformerBlock(nn.Module):
         norm2 = self.norm2(add1)
         mlp1 = self.mlp1(norm2, H, W)
         add2 = add1 + mlp1
-        # # 双路径transformer之后的合并模块1（相加的）
-        # # norm3 = self.norm3(add2 + mlp2)
-        # # norm3 = Rearrange("b (h w) d -> b d h w", h=H, w=W)(norm3)
-        # # mx = norm3 + self.residual(norm3)
-        # # mx = Rearrange("b d h w -> b (h w) d")(mx)
+        # add
+        # norm3 = self.norm3(add2 + mlp2)
+        # norm3 = Rearrange("b (h w) d -> b d h w", h=H, w=W)(norm3)
+        # mx = norm3 + self.residual(norm3)
+        # mx = Rearrange("b d h w -> b (h w) d")(mx)
 
-        # 双路径transformer之后的合并模块1（concat）
+        # concat
         merge = torch.cat((add2, mlp2), dim=2)
         merge = Rearrange("b (h w) d -> b d h w", h=H, w=W)(merge)
         merge = self.act1(self.conv1(merge))
@@ -495,17 +422,17 @@ class MiT(nn.Module):
 
         # transformer encoder
         self.block1 = nn.ModuleList(
-            [DualTransformerBlock(in_dim[0], key_dim[0], value_dim[0], head_count, token_mlp) for _ in range(layers[0])]
+            [DPVT(in_dim[0], key_dim[0], value_dim[0], head_count, token_mlp) for _ in range(layers[0])]
         )
         self.norm1 = nn.LayerNorm(in_dim[0])
 
         self.block2 = nn.ModuleList(
-            [DualTransformerBlock(in_dim[1], key_dim[1], value_dim[1], head_count, token_mlp) for _ in range(layers[1])]
+            [DPVT(in_dim[1], key_dim[1], value_dim[1], head_count, token_mlp) for _ in range(layers[1])]
         )
         self.norm2 = nn.LayerNorm(in_dim[1])
 
         self.block3 = nn.ModuleList(
-            [DualTransformerBlock(in_dim[2], key_dim[2], value_dim[2], head_count, token_mlp) for _ in range(layers[2])]
+            [DPVT(in_dim[2], key_dim[2], value_dim[2], head_count, token_mlp) for _ in range(layers[2])]
         )
         self.norm3 = nn.LayerNorm(in_dim[2])
 
@@ -608,12 +535,12 @@ class MyDecoderLayer(nn.Module):
         key_dim = in_out_chan[2]
         value_dim = in_out_chan[3]
         if not is_last:
-            self.cross_attn = group_aggregation_bridge(dims, out_dim)
+            self.cross_attn = GCA(dims, out_dim)
             # transformer decoder
             self.last_layer = None
 
         else:
-            self.cross_attn = group_aggregation_bridge(dims, out_dim)
+            self.cross_attn = GCA(dims, out_dim)
             self.layer_up = FinalPatchExpand_X4(
                 input_resolution=input_size, dim=out_dim, dim_scale=4, norm_layer=norm_layer
             )
@@ -621,8 +548,8 @@ class MyDecoderLayer(nn.Module):
 
             # transformer decoder
 
-        self.layer_former_1 = DualTransformerBlock(out_dim, key_dim, value_dim, head_count, token_mlp_mode)
-        self.layer_former_2 = DualTransformerBlock(out_dim, key_dim, value_dim, head_count, token_mlp_mode)
+        self.layer_former_1 = DPVT(out_dim, key_dim, value_dim, head_count, token_mlp_mode)
+        self.layer_former_2 = DPVT(out_dim, key_dim, value_dim, head_count, token_mlp_mode)
 
         def init_weights(self):
             for m in self.modules():
@@ -641,7 +568,7 @@ class MyDecoderLayer(nn.Module):
         init_weights(self)
 
     def forward(self, x1, x2):
-        # 修改的加入新的交叉注意力模块
+        # 
         b, c, h, w = x2.shape
         cat_linear_x = self.cross_attn(x1, x2)
         tran_layer_1 = self.layer_former_1(cat_linear_x, h, w)
@@ -656,7 +583,7 @@ class MyDecoderLayer(nn.Module):
         return out
 
 
-class DAEFormer(nn.Module):
+class DPEG(nn.Module):
     def __init__(self, num_classes=9, head_count=1, token_mlp_mode="mix_skip"):
         super().__init__()
 
@@ -715,7 +642,7 @@ class DAEFormer(nn.Module):
 
 if __name__ == '__main__':
     image = torch.randn(1, 3, 224, 224)
-    model = DAEFormer(num_classes=9)
+    model = DPEG(num_classes=9)
     out = model(image)
     print(out.shape)
     macs, params = get_model_complexity_info(model, (3, 224, 224), as_strings=True,
